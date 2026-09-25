@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>束线保护双路径规划</title>
+<style>
+  :root {
+    --bg: #0f1420; --panel: #171e2e; --line: #2a3550; --text: #e8ecf5;
+    --muted: #8b96ad; --accent: #4f8cff; --ok: #34c98e; --warn: #f0a44a;
+    --err: #ef5b6e; --chip: #223052;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    line-height: 1.6;
+  }
+  header { padding: 28px 24px 8px; max-width: 980px; margin: 0 auto; }
+  header h1 { font-size: 22px; margin: 0 0 6px; }
+  header p { margin: 0; color: var(--muted); font-size: 14px; }
+  main { max-width: 980px; margin: 0 auto; padding: 16px 24px 48px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 12px; padding: 20px; margin-top: 16px;
+  }
+  .hidden { display: none; }
+  label { font-size: 13px; color: var(--muted); display: block; }
+  input {
+    background: #0d1320; border: 1px solid var(--line); color: var(--text);
+    border-radius: 8px; padding: 8px 10px; font-size: 14px; width: 100%;
+    font-family: inherit;
+  }
+  input:focus { outline: none; border-color: var(--accent); }
+  .endpoints { display: flex; gap: 16px; margin-bottom: 14px; }
+  .endpoints > div { flex: 1; }
+  table { width: 100%; border-collapse: collapse; }
+  th {
+    text-align: left; font-size: 12px; color: var(--muted);
+    padding: 6px 8px; border-bottom: 1px solid var(--line); font-weight: 500;
+  }
+  td { padding: 6px 8px; border-bottom: 1px solid #1e2740; }
+  td input { padding: 6px 8px; }
+  .toolbar { display: flex; gap: 12px; margin-top: 14px; }
+  button {
+    border: none; border-radius: 8px; padding: 9px 18px; font-size: 14px;
+    cursor: pointer; font-family: inherit;
+  }
+  #add-row { background: var(--chip); color: var(--text); }
+  #submit { background: var(--accent); color: #fff; font-weight: 600; }
+  #submit:disabled { opacity: .55; cursor: wait; }
+  .del-row { background: transparent; color: var(--muted); padding: 4px 8px; }
+  .del-row:hover { color: var(--err); }
+  h2 { font-size: 16px; margin: 0 0 12px; }
+  .badge {
+    display: inline-block; font-size: 12px; padding: 2px 10px;
+    border-radius: 999px; margin-bottom: 12px; font-weight: 600;
+  }
+  .badge.ok { background: rgba(52,201,142,.15); color: var(--ok); }
+  .badge.warn { background: rgba(240,164,74,.15); color: var(--warn); }
+  .badge.err { background: rgba(239,91,110,.15); color: var(--err); }
+  .chain { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 8px 0; }
+  .node {
+    background: #0d1320; border: 1px solid var(--line); border-radius: 8px;
+    padding: 4px 10px; font-size: 13px; font-weight: 600;
+  }
+  .seg-chip {
+    background: var(--chip); border-radius: 8px; padding: 4px 10px;
+    font-size: 12px; color: #bcd0ff; white-space: nowrap;
+  }
+  .seg-chip b { color: #fff; }
+  .arrow { color: var(--muted); }
+  .calc { color: var(--muted); font-size: 13px; font-family: ui-monospace, monospace; }
+  .total {
+    margin-top: 14px; padding: 12px 14px; border-radius: 10px;
+    background: rgba(79,140,255,.1); border: 1px solid rgba(79,140,255,.35);
+    font-size: 15px;
+  }
+  .total b { color: var(--accent); font-size: 18px; }
+  .path-block { padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; margin-top: 10px; }
+  .path-block h3 { margin: 0 0 4px; font-size: 14px; }
+  .err-item {
+    padding: 8px 12px; border-left: 3px solid var(--err);
+    background: rgba(239,91,110,.08); border-radius: 6px; margin-top: 8px; font-size: 14px;
+  }
+  .err-item code { color: var(--err); font-family: ui-monospace, monospace; }
+  .cut-nodes { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 14px; }
+  .note { color: var(--muted); font-size: 13px; margin-top: 12px; }
+  .busy { color: var(--muted); font-size: 14px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>束线保护信号接入 · 双路径规划</h1>
+  <p>录入有向光纤段（允许节点重合与并行光纤），提交后求解起点到终点两条边互不重复、总延迟最小的保护链路。</p>
+</header>
+<main>
+  <section class="panel">
+    <div class="endpoints">
+      <div><label>起点</label><input id="source" value="S" autocomplete="off"></div>
+      <div><label>终点</label><input id="target" value="T" autocomplete="off"></div>
+    </div>
+    <table>
+      <thead>
+        <tr><th style="width:22%">段标识</th><th>起点</th><th>终点</th><th style="width:18%">延迟（非负整数）</th><th style="width:8%"></th></tr>
+      </thead>
+      <tbody id="seg-body"></tbody>
+    </table>
+    <div class="toolbar">
+      <button id="add-row" type="button">+ 添加光纤段</button>
+      <button id="submit" type="button">提交求解</button>
+    </div>
+  </section>
+  <section id="result" class="panel hidden"></section>
+</main>
+
+<script>
+"use strict";
+
+// 示例草稿：局部最短路 S-A-B-T 占用共享光纤 e2，
+// "先最短路再删边"会误判无可行双路；全局最优为 S-A-T 与 S-B-T，总延迟 12。
+const SAMPLE = [
+  { id: "e1", from: "S", to: "A", delay: 1 },
+  { id: "e2", from: "A", to: "B", delay: 1 },
+  { id: "e3", from: "B", to: "T", delay: 1 },
+  { id: "e4", from: "S", to: "B", delay: 5 },
+  { id: "e5", from: "A", to: "T", delay: 5 },
+];
+
+const segBody = document.getElementById("seg-body");
+const resultPanel = document.getElementById("result");
+const submitBtn = document.getElementById("submit");
+
+// 请求序号 + 中止控制器：过期响应不得覆盖新草稿。
+let requestSeq = 0;
+let inflight = null;
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+
+function addRow(seg) {
+  const tr = document.createElement("tr");
+  tr.innerHTML =
+    '<td><input data-f="id" placeholder="如 e6" autocomplete="off"></td>' +
+    '<td><input data-f="from" autocomplete="off"></td>' +
+    '<td><input data-f="to" autocomplete="off"></td>' +
+    '<td><input data-f="delay" inputmode="numeric" autocomplete="off"></td>' +
+    '<td><button type="button" class="del-row" title="删除">✕</button></td>';
+  if (seg) {
+    tr.querySelector('[data-f="id"]').value = seg.id;
+    tr.querySelector('[data-f="from"]').value = seg.from;
+    tr.querySelector('[data-f="to"]').value = seg.to;
+    tr.querySelector('[data-f="delay"]').value = seg.delay;
+  }
+  tr.querySelector(".del-row").addEventListener("click", () => {
+    tr.remove();
+    clearResult();
+  });
+  segBody.appendChild(tr);
+}
+
+function collectPayload() {
+  const segments = [];
+  for (const tr of segBody.querySelectorAll("tr")) {
+    const val = (f) => tr.querySelector(`[data-f="${f}"]`).value.trim();
+    const rawDelay = val("delay");
+    segments.push({
+      id: val("id"),
+      from: val("from"),
+      to: val("to"),
+      // 原样上送：非法延迟由服务端定位报错，不在前端掩盖。
+      delay: /^-?\d+$/.test(rawDelay) ? parseInt(rawDelay, 10) : rawDelay,
+    });
+  }
+  return {
+    source: document.getElementById("source").value.trim(),
+    target: document.getElementById("target").value.trim(),
+    segments,
+  };
+}
+
+function clearResult() {
+  resultPanel.classList.add("hidden");
+  resultPanel.innerHTML = "";
+}
+
+function showBusy() {
+  resultPanel.classList.remove("hidden");
+  resultPanel.innerHTML = '<p class="busy">求解中…</p>';
+}
+
+function showErrors(errors) {
+  // 出错时清除旧结论，仅展示本次定位错误。
+  resultPanel.classList.remove("hidden");
+  const items = (errors && errors.length ? errors : [{ loc: "-", message: "未知错误" }])
+    .map((e) => `<div class="err-item"><code>${escapeHtml(e.loc)}</code>：${escapeHtml(e.message)}</div>`)
+    .join("");
+  resultPanel.innerHTML = `<span class="badge err">输入有误，旧结论已清除</span>${items}`;
+}
+
+function chainHtml(segments, start) {
+  let html = `<span class="node">${escapeHtml(start)}</span>`;
+  for (const s of segments) {
+    html +=
+      `<span class="seg-chip"><b>${escapeHtml(s.id)}</b> · 延迟 ${escapeHtml(s.delay)}</span>` +
+      `<span class="arrow">→</span><span class="node">${escapeHtml(s.to)}</span>`;
+  }
+  return html;
+}
+
+function showPaths(data) {
+  const blocks = data.paths.map((p, i) => {
+    const terms = p.segments.map((s) => s.delay).join(" + ");
+    return `<div class="path-block">
+      <h3>路径 ${i + 1} <span class="calc">（延迟 ${p.delay}）</span></h3>
+      <div class="chain">${chainHtml(p.segments, data.paths[i].segments[0].from)}</div>
+      <div class="calc">复算：${terms} = ${p.delay}</div>
+    </div>`;
+  }).join("");
+  const sum = data.paths.map((p) => p.delay).join(" + ");
+  resultPanel.classList.remove("hidden");
+  resultPanel.innerHTML = `<span class="badge ok">已求得两条边互不重复的保护链路</span>
+    ${blocks}
+    <div class="total">最小总延迟：<b>${data.totalDelay}</b> <span class="calc">（${sum} = ${data.totalDelay}）</span></div>`;
+}
+
+function showCut(data) {
+  const nodes = data.cut.sourceSet.map((n) => `<span class="node">${escapeHtml(n)}</span>`).join("");
+  const rows = data.cut.edges.map((e) =>
+    `<tr><td>${escapeHtml(e.id)}</td><td>${escapeHtml(e.from)}</td><td>${escapeHtml(e.to)}</td><td>${escapeHtml(e.delay)}</td></tr>`
+  ).join("");
+  resultPanel.classList.remove("hidden");
+  resultPanel.innerHTML = `<span class="badge warn">无法形成两条边互不重复的保护链路</span>
+    <h2>瓶颈证据（最小割）</h2>
+    <label>源侧节点集合（从起点在残余网络中可达）</label>
+    <div class="cut-nodes">${nodes}</div>
+    <label>全部外出割边（共 ${data.cut.edges.length} 条，容量不足 2，阻断第二条链路）</label>
+    <table><thead><tr><th>段标识</th><th>起点</th><th>终点</th><th>延迟</th></tr></thead>
+    <tbody>${rows}</tbody></table>
+    <p class="note">${escapeHtml(data.message || "")}</p>`;
+}
+
+async function submit() {
+  if (inflight) inflight.abort();          // 取消上一个未完成的请求
+  const ctrl = new AbortController();
+  inflight = ctrl;
+  const seq = ++requestSeq;                // 过期响应一律丢弃
+  clearResult();                           // 新草稿提交，清除旧结论
+  showBusy();
+  submitBtn.disabled = true;
+  try {
+    const resp = await fetch("/api/protected-paths", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(collectPayload()),
+      signal: ctrl.signal,
+    });
+    const data = await resp.json();
+    if (seq !== requestSeq) return;        // 已有更新的草稿/请求
+    if (!resp.ok) { showErrors(data.errors); return; }
+    if (data.status === "ok") showPaths(data);
+    else showCut(data);
+  } catch (err) {
+    if (err.name === "AbortError") return; // 被新请求取代，属正常
+    if (seq !== requestSeq) return;
+    showErrors([{ loc: "network", message: "请求失败：" + err.message }]);
+  } finally {
+    if (seq === requestSeq) submitBtn.disabled = false;
+  }
+}
+
+document.getElementById("add-row").addEventListener("click", () => addRow());
+submitBtn.addEventListener("click", submit);
+// 任何编辑都使旧结论失效（清除旧结论，避免误导）。
+document.querySelector("main").addEventListener("input", clearResult);
+
+SAMPLE.forEach(addRow);
+</script>
+</body>
+</html>

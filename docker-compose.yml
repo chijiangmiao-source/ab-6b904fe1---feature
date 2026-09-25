@@ -1,0 +1,28 @@
+services:
+  app:
+    build: .
+    image: fiber-protection:latest
+    ports:
+      # 宿主机端口可通过 .env 或环境变量 HOST_PORT 配置，默认 8080
+      - "${HOST_PORT:-8080}:8080"
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health', timeout=3).status==200 else 1)"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  verify:
+    image: fiber-protection:latest
+    build: .
+    working_dir: /workspace
+    environment:
+      APP_PORT: "8080"
+    command: ["bash", "verify/run.sh"]
+    depends_on:
+      app:
+        condition: service_healthy
