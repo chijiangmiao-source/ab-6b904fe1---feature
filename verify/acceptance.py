@@ -6,7 +6,9 @@
      两条路径边互不重复、链路连续、总延迟可复算；
   3. 共享瓶颈：返回源侧节点集合与**全部**外出割边，并独立验证割的容量与阻断性；
   4. 负延迟/重复段标识/不存在端点/不可达均定位报错；
-  5. 并行光纤与零延迟；静态页面可访问。
+  5. 并行光纤/零延迟、静态页面与过期请求防护的冒烟；
+  6. 最优段审计：必经段判定（零见证）、可替换段的等延迟双路见证、
+     按段复算一致性、重复审计稳定性、非法输入定位、独立枚举对拍。
 
 任何一项失败即以非零退出码退出。
 """
@@ -41,6 +43,22 @@ BOTTLENECK_CASE = {
         {"id": "e3", "from": "A", "to": "X", "delay": 4},
         {"id": "e4", "from": "B", "to": "X", "delay": 5},
         {"id": "e5", "from": "X", "to": "T", "delay": 1},
+    ],
+}
+
+# 审计用例：已用段 x(A->B,2) 可被等延迟绕行 A->C->B(1+1) 替换；
+# e1..e4 是全部最优方案共有的必经段；e5/e6 基准未选用。
+AUDIT_CASE = {
+    "source": "S",
+    "target": "T",
+    "segments": [
+        {"id": "e1", "from": "S", "to": "A", "delay": 0},
+        {"id": "x", "from": "A", "to": "B", "delay": 2},
+        {"id": "e2", "from": "B", "to": "T", "delay": 0},
+        {"id": "e3", "from": "S", "to": "C", "delay": 0},
+        {"id": "e4", "from": "C", "to": "T", "delay": 0},
+        {"id": "e5", "from": "A", "to": "C", "delay": 1},
+        {"id": "e6", "from": "C", "to": "B", "delay": 1},
     ],
 }
 
@@ -299,6 +317,174 @@ def verify_parallel_and_page(base_url: str) -> None:
           "requestSeq" in html and "AbortController" in html)
     check("页面在出错/编辑时清除旧结论",
           "clearResult" in html and "旧结论已清除" in html)
+    check("结果页可发起最优段审计",
+          "segment-audit" in html and "发起最优段审计" in html)
+    check("审计区含必经/可替换并列复核",
+          "必经段" in html and "可替换段" in html and "基准方案" in html)
+
+
+def _audit_request(base_url: str, payload, segment_id=None):
+    body = dict(payload)
+    if segment_id is not None:
+        body["segmentId"] = segment_id
+    return _post(base_url, "/api/segment-audit", body)
+
+
+def _post(base_url: str, path: str, payload):
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        base_url + path, data=body,
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode())
+
+
+def _optimum_pair_sets(segments, source, target):
+    """独立枚举：返回 (最小总延迟, {最优路径对 frozenset({id,..}), frozenset(...)}）。"""
+    adj = {}
+    for s in segments:
+        adj.setdefault(s["from"], []).append((s["to"], s))
+    paths = []
+
+    def dfs(node, used, used_nodes, cost):
+        if node == target:
+            paths.append((frozenset(used), cost))
+            return
+        for nxt, s in adj.get(node, []):
+            if s["id"] not in used and nxt not in used_nodes:
+                dfs(nxt, used | {s["id"]}, used_nodes | {nxt}, cost + s["delay"])
+
+    dfs(source, frozenset(), {source}, 0)
+    best, best_sets = None, set()
+    for (p1, c1), (p2, c2) in itertools.combinations_with_replacement(paths, 2):
+        if p1.isdisjoint(p2):
+            cand = c1 + c2
+            if best is None or cand < best:
+                best, best_sets = cand, {frozenset(p1 | p2)}
+            elif cand == best:
+                best_sets.add(frozenset(p1 | p2))
+    return best, best_sets
+
+
+def _validate_witness(entry, baseline_total, source, target):
+    """复核单段见证：两条完整链路、连续、边互不重复、不含该段、总延迟相同。"""
+    seg_id = entry["id"]
+    witness = entry.get("witness")
+    if not (isinstance(witness, list) and len(witness) == 2):
+        return False, "witness 必须是两条链路"
+    used = []
+    for p in witness:
+        chain = p["segments"]
+        if not chain or chain[0]["from"] != source or chain[-1]["to"] != target:
+            return False, f"{seg_id} 见证链路非 {source}->{target}"
+        for a, b in zip(chain, chain[1:]):
+            if a["to"] != b["from"]:
+                return False, f"{seg_id} 见证链路不连续"
+        if p["delay"] != sum(s["delay"] for s in chain):
+            return False, f"{seg_id} 见证路径延迟不可复算"
+        used.extend(s["id"] for s in chain)
+    if seg_id in used:
+        return False, f"{seg_id} 见证仍含被审计段"
+    if len(used) != len(set(used)):
+        return False, f"{seg_id} 见证两条路径边重复"
+    if sum(p["delay"] for p in witness) != baseline_total:
+        return False, f"{seg_id} 见证总延迟与基准不同"
+    return True, ""
+
+
+def verify_segment_audit(base_url: str) -> None:
+    print("\n== 5. 最优段审计（零费用交换环判定 + 等延迟替代见证） ==")
+    status, data = _post(base_url, "/api/segment-audit", AUDIT_CASE)
+    check("审计 HTTP 200", status == 200, str(data))
+    check("审计 status=ok", data.get("status") == "ok", str(data))
+    check("审计基准总延迟 = 2", data.get("totalDelay") == 2, str(data.get("totalDelay")))
+
+    baseline = data.get("baseline", [])
+    check("基准返回两条完整链路", len(baseline) == 2, str(baseline))
+    base_ids = {s["id"] for p in baseline for s in p["segments"]}
+    check("基准边集 = {e1,x,e2,e3,e4}",
+          base_ids == {"e1", "x", "e2", "e3", "e4"}, str(base_ids))
+    check("基准总延迟可复算",
+          sum(s["delay"] for p in baseline for s in p["segments"]) == 2)
+
+    entries = {s["id"]: s for s in data.get("segments", [])}
+    check("逐段覆盖拓扑全部 7 段",
+          set(entries) == {f"e{i}" for i in range(1, 7)} | {"x"}, str(set(entries)))
+
+    # 独立枚举口径对拍：必经 = 出现在全部最优对；可替换 = 存在不含它的最优对。
+    best, best_sets = _optimum_pair_sets(AUDIT_CASE["segments"], "S", "T")
+    check("独立枚举确认最小总延迟 = 2", best == 2, f"枚举得 {best}")
+    check("存在两个等价最优方案（经 x 与经 e5/e6 绕行）",
+          len(best_sets) == 2, f"{[set(x) for x in best_sets]}")
+    for sid, e in entries.items():
+        in_all = all(sid in pair for pair in best_sets)
+        in_base = sid in base_ids
+        if not in_base:
+            want = "unused"
+        elif in_all:
+            want = "mandatory"
+        else:
+            want = "replaceable"
+        check(f"段 {sid} 归类 = {want}（独立枚举口径）",
+              e["classification"] == want, str(e["classification"]))
+        if want == "mandatory":
+            check(f"必经段 {sid} 不伪造见证（witness=null）", e["witness"] is None)
+        elif want == "replaceable":
+            ok, detail = _validate_witness(e, data["totalDelay"], "S", "T")
+            check(f"可替换段 {sid} 见证为等延迟合法双路", ok, detail)
+            wids = {z["id"] for p in e["witness"] for z in p["segments"]}
+            check(f"可替换段 {sid} 见证走绕行 e5/e6", {"e5", "e6"} <= wids, str(wids))
+
+    # 按段复算：结论必须与整表完全一致。
+    for sid in ("x", "e1", "e5"):
+        st, one = _audit_request(base_url, AUDIT_CASE, sid)
+        check(f"按段复算 {sid} HTTP 200", st == 200, str(one))
+        seg_list = one.get("segments", [])
+        check(f"按段复算 {sid} 仅返回该段", len(seg_list) == 1 and seg_list[0]["id"] == sid)
+        if st == 200 and seg_list:
+            got = seg_list[0]
+            check(f"按段复算 {sid} 归类/见证与整表一致",
+                  got == entries[sid], f"{got} != {entries[sid]}")
+
+    # 重复查看同一段：归类与见证保持一致（确定性）。
+    st, repeat1 = _audit_request(base_url, AUDIT_CASE, "x")
+    st2, repeat2 = _audit_request(base_url, AUDIT_CASE, "x")
+    check("重复审计响应完全一致", st == st2 == 200 and repeat1 == repeat2)
+
+    # 不存在的段标识 / 非法输入 / 无双路，均 400 且定位字段。
+    st, d = _audit_request(base_url, AUDIT_CASE, "missing-id")
+    check("审计未知段标识返回 400 并定位 segmentId",
+          st == 400 and any(e["loc"] == "segmentId" for e in d.get("errors", [])), str(d))
+    bad = json.loads(json.dumps(AUDIT_CASE))
+    bad["segments"][0]["delay"] = -5
+    st, d = _post(base_url, "/api/segment-audit", bad)
+    check("审计负延迟 400 定位",
+          st == 400 and any(e["loc"] == "segments[0].delay" for e in d.get("errors", [])))
+    only_one = {
+        "source": "S", "target": "T",
+        "segments": [{"id": "a", "from": "S", "to": "T", "delay": 1}],
+    }
+    st, d = _post(base_url, "/api/segment-audit", only_one)
+    check("无双路拓扑审计返回 400", st == 400, str(d))
+
+    # 零延迟并行段冒烟：两条零延迟并行段皆必经，无伪造见证。
+    zero_parallel = {
+        "source": "S", "target": "T",
+        "segments": [
+            {"id": "z1", "from": "S", "to": "T", "delay": 0},
+            {"id": "z2", "from": "S", "to": "T", "delay": 0},
+        ],
+    }
+    st, d = _post(base_url, "/api/segment-audit", zero_parallel)
+    check("零延迟并行段审计 200", st == 200, str(d))
+    if st == 200:
+        check("两条零延迟并行段均为必经段",
+              all(s["classification"] == "mandatory" and s["witness"] is None
+                  for s in d["segments"]), str(d["segments"]))
 
 
 def main() -> int:
@@ -316,6 +502,7 @@ def main() -> int:
     verify_cut_evidence(args.base_url)
     verify_error_cases(args.base_url)
     verify_parallel_and_page(args.base_url)
+    verify_segment_audit(args.base_url)
 
     print("\n" + "=" * 60)
     if failures:

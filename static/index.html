@@ -69,6 +69,7 @@
     font-size: 12px; color: #bcd0ff; white-space: nowrap;
   }
   .seg-chip b { color: #fff; }
+  .seg-chip.hl { outline: 2px solid var(--warn); }
   .arrow { color: var(--muted); }
   .calc { color: var(--muted); font-size: 13px; font-family: ui-monospace, monospace; }
   .total {
@@ -87,12 +88,41 @@
   .cut-nodes { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 14px; }
   .note { color: var(--muted); font-size: 13px; margin-top: 12px; }
   .busy { color: var(--muted); font-size: 14px; }
+  /* ---- 最优段审计 ---- */
+  #audit-btn { background: var(--chip); color: var(--text); border: 1px solid var(--accent); }
+  .audit-area { margin-top: 16px; border-top: 1px dashed var(--line); padding-top: 14px; }
+  .cls-badge {
+    display: inline-block; font-size: 12px; padding: 1px 9px;
+    border-radius: 999px; font-weight: 600; white-space: nowrap;
+  }
+  .cls-badge.mandatory { background: rgba(240,164,74,.16); color: var(--warn); }
+  .cls-badge.replaceable { background: rgba(52,201,142,.16); color: var(--ok); }
+  .cls-badge.unused { background: rgba(139,150,173,.16); color: var(--muted); }
+  .seg-audit-btn {
+    background: var(--chip); color: var(--text); padding: 3px 10px;
+    font-size: 12px; border-radius: 6px;
+  }
+  .seg-audit-btn:hover { border-color: var(--accent); }
+  .compare { display: flex; gap: 14px; margin-top: 10px; flex-wrap: wrap; }
+  .compare-col {
+    flex: 1; min-width: 280px; border: 1px solid var(--line);
+    border-radius: 10px; padding: 12px 14px; background: #131a2a;
+  }
+  .compare-col h3 { margin: 0 0 6px; font-size: 14px; }
+  .compare-col .path-block { background: var(--panel); }
+  .verdict {
+    margin-top: 10px; padding: 10px 12px; border-radius: 8px; font-size: 13px;
+    background: rgba(52,201,142,.08); border: 1px solid rgba(52,201,142,.3);
+  }
+  .verdict.mandatory {
+    background: rgba(240,164,74,.08); border-color: rgba(240,164,74,.3);
+  }
 </style>
 </head>
 <body>
 <header>
   <h1>束线保护信号接入 · 双路径规划</h1>
-  <p>录入有向光纤段（允许节点重合与并行光纤），提交后求解起点到终点两条边互不重复、总延迟最小的保护链路。</p>
+  <p>录入有向光纤段（允许节点重合与并行光纤），提交后求解起点到终点两条边互不重复、总延迟最小的保护链路；求解后可在结果页发起最优段审计，逐段核对必经/可替换归类与替代见证。</p>
 </header>
 <main>
   <section class="panel">
@@ -132,8 +162,14 @@ const resultPanel = document.getElementById("result");
 const submitBtn = document.getElementById("submit");
 
 // 请求序号 + 中止控制器：过期响应不得覆盖新草稿。
+// 规划与审计各自独立计数；任何编辑/新提交都会使旧审计结论立即失效。
 let requestSeq = 0;
 let inflight = null;
+let auditSeq = 0;
+let auditInflight = null;
+let lastAudit = null;        // 当前结果对应的整表审计结论
+const detailCache = {};      // 段标识 -> 单段复算结果（重复查看保持一致）
+let detailSeq = 0;           // 单段复算序号：较新的查看覆盖较旧的
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({
@@ -182,7 +218,16 @@ function collectPayload() {
   };
 }
 
+function invalidateAudit() {
+  // 旧审计结论立即失效：中止在途审计、使未返回的响应过期、清空缓存。
+  auditSeq += 1;
+  if (auditInflight) { auditInflight.abort(); auditInflight = null; }
+  lastAudit = null;
+  for (const k of Object.keys(detailCache)) delete detailCache[k];
+}
+
 function clearResult() {
+  invalidateAudit();
   resultPanel.classList.add("hidden");
   resultPanel.innerHTML = "";
 }
@@ -194,6 +239,7 @@ function showBusy() {
 
 function showErrors(errors) {
   // 出错时清除旧结论，仅展示本次定位错误。
+  invalidateAudit();
   resultPanel.classList.remove("hidden");
   const items = (errors && errors.length ? errors : [{ loc: "-", message: "未知错误" }])
     .map((e) => `<div class="err-item"><code>${escapeHtml(e.loc)}</code>：${escapeHtml(e.message)}</div>`)
@@ -201,33 +247,43 @@ function showErrors(errors) {
   resultPanel.innerHTML = `<span class="badge err">输入有误，旧结论已清除</span>${items}`;
 }
 
-function chainHtml(segments, start) {
+function chainHtml(segments, start, highlightId) {
   let html = `<span class="node">${escapeHtml(start)}</span>`;
   for (const s of segments) {
+    const cls = s.id === highlightId ? "seg-chip hl" : "seg-chip";
     html +=
-      `<span class="seg-chip"><b>${escapeHtml(s.id)}</b> · 延迟 ${escapeHtml(s.delay)}</span>` +
+      `<span class="${cls}"><b>${escapeHtml(s.id)}</b> · 延迟 ${escapeHtml(s.delay)}</span>` +
       `<span class="arrow">→</span><span class="node">${escapeHtml(s.to)}</span>`;
   }
   return html;
 }
 
+function pathBlockHtml(path, index, start, highlightId) {
+  const terms = path.segments.map((s) => s.delay).join(" + ");
+  return `<div class="path-block">
+    <h3>路径 ${index + 1} <span class="calc">（延迟 ${path.delay}）</span></h3>
+    <div class="chain">${chainHtml(path.segments, start, highlightId)}</div>
+    <div class="calc">复算：${terms} = ${path.delay}</div>
+  </div>`;
+}
+
 function showPaths(data) {
-  const blocks = data.paths.map((p, i) => {
-    const terms = p.segments.map((s) => s.delay).join(" + ");
-    return `<div class="path-block">
-      <h3>路径 ${i + 1} <span class="calc">（延迟 ${p.delay}）</span></h3>
-      <div class="chain">${chainHtml(p.segments, data.paths[i].segments[0].from)}</div>
-      <div class="calc">复算：${terms} = ${p.delay}</div>
-    </div>`;
-  }).join("");
+  invalidateAudit();   // 新规划结果出炉，旧审计结论不得保留
+  const blocks = data.paths.map((p, i) =>
+    pathBlockHtml(p, i, p.segments[0].from, null)
+  ).join("");
   const sum = data.paths.map((p) => p.delay).join(" + ");
   resultPanel.classList.remove("hidden");
   resultPanel.innerHTML = `<span class="badge ok">已求得两条边互不重复的保护链路</span>
     ${blocks}
-    <div class="total">最小总延迟：<b>${data.totalDelay}</b> <span class="calc">（${sum} = ${data.totalDelay}）</span></div>`;
+    <div class="total">最小总延迟：<b>${data.totalDelay}</b> <span class="calc">（${sum} = ${data.totalDelay}）</span></div>
+    <div class="toolbar"><button id="audit-btn" type="button">发起最优段审计</button></div>
+    <div id="audit-area" class="audit-area hidden"></div>`;
+  document.getElementById("audit-btn").addEventListener("click", runAudit);
 }
 
 function showCut(data) {
+  invalidateAudit();
   const nodes = data.cut.sourceSet.map((n) => `<span class="node">${escapeHtml(n)}</span>`).join("");
   const rows = data.cut.edges.map((e) =>
     `<tr><td>${escapeHtml(e.id)}</td><td>${escapeHtml(e.from)}</td><td>${escapeHtml(e.to)}</td><td>${escapeHtml(e.delay)}</td></tr>`
@@ -248,7 +304,7 @@ async function submit() {
   const ctrl = new AbortController();
   inflight = ctrl;
   const seq = ++requestSeq;                // 过期响应一律丢弃
-  clearResult();                           // 新草稿提交，清除旧结论
+  clearResult();                           // 新草稿提交，清除旧结论（含审计）
   showBusy();
   submitBtn.disabled = true;
   try {
@@ -272,9 +328,152 @@ async function submit() {
   }
 }
 
+// ---------- 最优段审计 ----------
+
+const CLS_LABEL = {
+  mandatory: "必经段",
+  replaceable: "可替换段",
+  unused: "未选用",
+};
+
+async function runAudit() {
+  if (auditInflight) auditInflight.abort();   // 取消上一次未完成的审计
+  const ctrl = new AbortController();
+  auditInflight = ctrl;
+  const seq = ++auditSeq;                     // 过期审计响应一律丢弃
+  lastAudit = null;
+  for (const k of Object.keys(detailCache)) delete detailCache[k];
+  const area = document.getElementById("audit-area");
+  area.classList.remove("hidden");
+  area.innerHTML = '<p class="busy">审计中：正在最优二单位流的残量网络上检查零费用交换环…</p>';
+  try {
+    const resp = await fetch("/api/segment-audit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(collectPayload()),
+      signal: ctrl.signal,
+    });
+    const data = await resp.json();
+    if (seq !== auditSeq) return;             // 已有更新的审计/草稿
+    if (!resp.ok) {
+      area.innerHTML = (data.errors || []).map((e) =>
+        `<div class="err-item"><code>${escapeHtml(e.loc)}</code>：${escapeHtml(e.message)}</div>`
+      ).join("");
+      return;
+    }
+    lastAudit = data;
+    renderAuditTable();
+  } catch (err) {
+    if (err.name === "AbortError") return;
+    if (seq !== auditSeq) return;
+    area.innerHTML = `<div class="err-item"><code>network</code>：审计请求失败：${escapeHtml(err.message)}</div>`;
+  }
+}
+
+function renderAuditTable() {
+  const data = lastAudit;
+  const rows = data.segments.map((s) => {
+    const action = s.usedInBaseline
+      ? `<button type="button" class="seg-audit-btn" data-seg="${escapeHtml(s.id)}">查看 / 按段复算</button>`
+      : '<span class="calc">基准未选用</span>';
+    return `<tr>
+      <td><b>${escapeHtml(s.id)}</b></td>
+      <td>${escapeHtml(s.from)} → ${escapeHtml(s.to)}</td>
+      <td>${escapeHtml(s.delay)}</td>
+      <td>${s.usedInBaseline ? "已用" : "未用"}</td>
+      <td><span class="cls-badge ${s.classification}">${CLS_LABEL[s.classification]}</span></td>
+      <td>${action}</td>
+    </tr>`;
+  }).join("");
+  const area = document.getElementById("audit-area");
+  area.innerHTML = `<span class="badge ok">审计完成：基准最小总延迟 ${data.totalDelay}</span>
+    <p class="note">归类依据：最优二单位流残量网络中的零费用交换环。必经段 = 全部最小总延迟双路方案均使用该段；可替换段 = 存在不含该段、总延迟与基准完全相同的替代双路（附见证）。</p>
+    <table>
+      <thead><tr><th>段标识</th><th>走向</th><th>延迟</th><th>基准中</th><th>归类</th><th>见证</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <div id="seg-detail"></div>`;
+  for (const btn of area.querySelectorAll(".seg-audit-btn")) {
+    btn.addEventListener("click", () => showSegmentDetail(btn.dataset.seg));
+  }
+}
+
+function pathsHtml(paths, source, highlightId) {
+  return paths.map((p, i) =>
+    pathBlockHtml(p, i, p.segments[0].from, highlightId)
+  ).join("") + `<div class="calc">合计：${paths.map((p) => p.delay).join(" + ")} = ${paths.reduce((a, p) => a + p.delay, 0)}</div>`;
+}
+
+async function showSegmentDetail(segId) {
+  const auditToken = auditSeq;   // 审计结论在复算回来时必须仍未过期
+  const myToken = ++detailSeq;   // 较新的段查看覆盖较旧的
+  const detail = document.getElementById("seg-detail");
+  detail.innerHTML = '<p class="busy">按段复算中…</p>';
+  let entry = detailCache[segId];
+  try {
+    if (!entry) {
+      const payload = Object.assign(collectPayload(), { segmentId: segId });
+      const resp = await fetch("/api/segment-audit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await resp.json();
+      if (myToken !== detailSeq || auditToken !== auditSeq || !lastAudit) return;
+      if (!resp.ok) {
+        detail.innerHTML = (data.errors || []).map((e) =>
+          `<div class="err-item"><code>${escapeHtml(e.loc)}</code>：${escapeHtml(e.message)}</div>`
+        ).join("");
+        return;
+      }
+      entry = data.segments[0];
+      detailCache[segId] = entry;
+    }
+  } catch (err) {
+    if (myToken !== detailSeq) return;
+    detail.innerHTML = `<div class="err-item"><code>network</code>：复算失败：${escapeHtml(err.message)}</div>`;
+    return;
+  }
+  if (myToken !== detailSeq || auditToken !== auditSeq || !lastAudit) return;
+
+  // 与整表结论比对：重复查看同一段时归类与见证必须保持一致。
+  const inTable = lastAudit.segments.find((s) => s.id === segId);
+  const consistent = inTable
+    && inTable.classification === entry.classification
+    && JSON.stringify(inTable.witness) === JSON.stringify(entry.witness);
+  const consistentHtml = consistent
+    ? '<span class="cls-badge replaceable">复算与整表结论一致</span>'
+    : '<span class="cls-badge mandatory">复算与整表结论不一致（拓扑可能已变化）</span>';
+
+  const total = lastAudit.totalDelay;
+  const baselineHtml = `<div class="compare-col">
+    <h3>基准方案 <span class="calc">（最小总延迟 ${total}）</span></h3>
+    ${pathsHtml(lastAudit.baseline, lastAudit.source, segId)}
+  </div>`;
+
+  let body;
+  if (entry.classification === "replaceable" && entry.witness) {
+    const wTotal = entry.witness.reduce((a, p) => a + p.delay, 0);
+    body = `<div class="compare">
+        ${baselineHtml}
+        <div class="compare-col">
+          <h3>替代方案 <span class="calc">（不含段 ${escapeHtml(segId)}，总延迟 ${wTotal}）</span></h3>
+          ${pathsHtml(entry.witness, lastAudit.source, null)}
+        </div>
+      </div>
+      <div class="verdict">段 <b>${escapeHtml(segId)}</b> 为可替换段：替代双路与基准边互不重复、总延迟相同（${total} = ${wTotal}），可逐段核对。</div>`;
+  } else if (entry.classification === "mandatory") {
+    body = `<div class="compare">${baselineHtml}</div>
+      <div class="verdict mandatory">段 <b>${escapeHtml(segId)}</b> 为必经段：残量网络中不存在绕过它的零费用交换环，所有最小总延迟（${total}）的双路方案都必须使用该段，不存在等延迟替代。</div>`;
+  } else {
+    body = `<div class="verdict">段 <b>${escapeHtml(segId)}</b> 未被基准方案选用，无需替代见证。</div>`;
+  }
+  detail.innerHTML = `<h2 style="margin-top:14px">段 ${escapeHtml(segId)} 审计明细 ${consistentHtml}</h2>${body}`;
+}
+
 document.getElementById("add-row").addEventListener("click", () => addRow());
 submitBtn.addEventListener("click", submit);
-// 任何编辑都使旧结论失效（清除旧结论，避免误导）。
+// 任何编辑都使旧结论失效（清除旧结论与审计结论，避免误导）。
 document.querySelector("main").addEventListener("input", clearResult);
 
 SAMPLE.forEach(addRow);
