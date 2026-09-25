@@ -12,6 +12,9 @@
 若最大流不足 2（无法形成双路），则在残余网络上从起点可达的节点集合
 即最小割的源侧集合，所有由该集合指向外部的原始弧即全部外出割边，
 用于向工程师解释瓶颈如何阻断保护链路。
+
+`compute_optimal_flow` 返回的残余网络快照同时供"最优段审计"复用：
+审计判定只读取该快照，不改动求解结果。
 """
 from __future__ import annotations
 
@@ -50,16 +53,29 @@ class SolveResult:
     cut: CutResult | None = None
 
 
-def solve_two_paths(
-    segments: list[Segment], source: str, target: str
-) -> SolveResult:
-    """求 source -> target 的两条边互不重复、总延迟最小的路径。
+@dataclass
+class FlowState:
+    """最小费用流计算后的残余网络快照。
 
-    返回:
-      - "ok":           paths 为两条路径, total_delay 为可复算的最小总延迟
-      - "insufficient": 存在路径但不足两条, cut 给出源侧节点集合与全部外出割边
-      - "unreachable":  起点到终点根本不可达
+    graph 为残余网络邻接表，边为列表 [to, rev_index, cap, cost, seg_pos]：
+    前向边与反向边的 seg_pos 都是对应原始段的下标（反向边即抵消该段流量）；
+    forward_edges[pos] 即第 pos 条原始段的前向边对象本身
+    （残余容量 0 表示该段载流 1，可用 `is` 与残余边比对方向）。
     """
+
+    names: list[str]
+    index_of: dict[str, int]
+    source: int
+    target: int
+    graph: list[list[list]]
+    forward_edges: list[list]
+    flow: int
+
+
+def compute_optimal_flow(
+    segments: list[Segment], source: str, target: str
+) -> FlowState:
+    """容量 1、费用为延迟的最小费用流（SSP + Johnson 势函数 + Dijkstra）。"""
     index_of: dict[str, int] = {}
     names: list[str] = []
 
@@ -83,7 +99,7 @@ def solve_two_paths(
     for pos, seg in enumerate(segments):
         u, v = index_of[seg.src], index_of[seg.dst]
         fwd = [v, len(graph[v]), 1, seg.delay, pos]
-        rev = [u, len(graph[u]), 0, -seg.delay, -1]
+        rev = [u, len(graph[u]), 0, -seg.delay, pos]
         graph[u].append(fwd)
         graph[v].append(rev)
         forward_edges.append(fwd)
@@ -124,46 +140,69 @@ def solve_two_paths(
             v = prev_node[v]
         flow += 1
 
-    if flow == 0:
-        return SolveResult(status="unreachable")
+    return FlowState(names, index_of, s, t, graph, forward_edges, flow)
 
-    if flow < REQUIRED_FLOW:
-        # ---- 最小割证据：残余网络中从起点可达的集合 + 全部外出割边 ----
-        reachable = [False] * n
-        reachable[s] = True
-        stack = [s]
-        while stack:
-            v = stack.pop()
-            for e in graph[v]:
-                if e[2] > 0 and not reachable[e[0]]:
-                    reachable[e[0]] = True
-                    stack.append(e[0])
-        cut_edges = [
-            seg
-            for seg in segments
-            if reachable[index_of[seg.src]] and not reachable[index_of[seg.dst]]
-        ]
-        source_set = [names[i] for i in range(n) if reachable[i]]
-        return SolveResult(
-            status="insufficient", cut=CutResult(source_set, cut_edges)
-        )
 
-    # ---- 分解两条路径：沿流量为 1 的原始弧从起点走到终点，走两遍 ----
+def min_cut(state: FlowState, segments: list[Segment]) -> CutResult:
+    """残余网络中从起点可达的集合（最小割源侧）与全部外出割边。"""
+    n = len(state.names)
+    reachable = [False] * n
+    reachable[state.source] = True
+    stack = [state.source]
+    while stack:
+        v = stack.pop()
+        for e in state.graph[v]:
+            if e[2] > 0 and not reachable[e[0]]:
+                reachable[e[0]] = True
+                stack.append(e[0])
+    cut_edges = [
+        seg
+        for seg in segments
+        if reachable[state.index_of[seg.src]]
+        and not reachable[state.index_of[seg.dst]]
+    ]
+    source_set = [state.names[i] for i in range(n) if reachable[i]]
+    return CutResult(source_set, cut_edges)
+
+
+def decompose_paths(state: FlowState, segments: list[Segment]) -> list[PathResult]:
+    """沿流量为 1 的原始弧从起点走到终点，走 REQUIRED_FLOW 遍。"""
     adjacency: dict[int, list[int]] = {}
     for pos, seg in enumerate(segments):
-        if forward_edges[pos][2] == 0:  # 容量耗尽 => 承载 1 单位流量
-            adjacency.setdefault(index_of[seg.src], []).append(pos)
+        if state.forward_edges[pos][2] == 0:  # 容量耗尽 => 承载 1 单位流量
+            adjacency.setdefault(state.index_of[seg.src], []).append(pos)
 
     paths: list[PathResult] = []
     for _ in range(REQUIRED_FLOW):
-        v = s
+        v = state.source
         chosen: list[Segment] = []
-        while v != t:
+        while v != state.target:
             pos = adjacency[v].pop()
             chosen.append(segments[pos])
-            v = index_of[segments[pos].dst]
+            v = state.index_of[segments[pos].dst]
         paths.append(PathResult(chosen, sum(seg.delay for seg in chosen)))
+    return paths
 
+
+def solve_two_paths(
+    segments: list[Segment], source: str, target: str
+) -> SolveResult:
+    """求 source -> target 的两条边互不重复、总延迟最小的路径。
+
+    返回:
+      - "ok":           paths 为两条路径, total_delay 为可复算的最小总延迟
+      - "insufficient": 存在路径但不足两条, cut 给出源侧节点集合与全部外出割边
+      - "unreachable":  起点到终点根本不可达
+    """
+    state = compute_optimal_flow(segments, source, target)
+
+    if state.flow == 0:
+        return SolveResult(status="unreachable")
+
+    if state.flow < REQUIRED_FLOW:
+        return SolveResult(status="insufficient", cut=min_cut(state, segments))
+
+    paths = decompose_paths(state, segments)
     return SolveResult(
         status="ok",
         paths=paths,

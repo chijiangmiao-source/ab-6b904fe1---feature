@@ -6,7 +6,10 @@
      两条路径边互不重复、链路连续、总延迟可复算；
   3. 共享瓶颈：返回源侧节点集合与**全部**外出割边，并独立验证割的容量与阻断性；
   4. 负延迟/重复段标识/不存在端点/不可达均定位报错；
-  5. 并行光纤与零延迟；静态页面可访问。
+  5. 并行光纤与零延迟；静态页面可访问；
+  6. 最优段审计：唯一最优下已用段判为必经段且不伪造见证；多等价最优下
+     可替换段的替代见证独立复核（完整双路、边互不重复、不含被审段、
+     总延迟与基准相同）；按段复算与重复审计结果一致。
 
 任何一项失败即以非零退出码退出。
 """
@@ -44,6 +47,31 @@ BOTTLENECK_CASE = {
     ],
 }
 
+# 三条等费路由：最优双路不唯一，基准方案的每条已用段都可被等费替代。
+MULTI_OPTIMA_CASE = {
+    "source": "S",
+    "target": "T",
+    "segments": [
+        {"id": "a1", "from": "S", "to": "A", "delay": 1},
+        {"id": "a2", "from": "A", "to": "T", "delay": 1},
+        {"id": "b1", "from": "S", "to": "B", "delay": 1},
+        {"id": "b2", "from": "B", "to": "T", "delay": 1},
+        {"id": "c1", "from": "S", "to": "C", "delay": 1},
+        {"id": "c2", "from": "C", "to": "T", "delay": 1},
+    ],
+}
+
+# 零延迟 + 并行段：p1(0) 为必经段，p2(3) 可由并行段 p3(3) 等费替换。
+MIXED_CASE = {
+    "source": "S",
+    "target": "T",
+    "segments": [
+        {"id": "p1", "from": "S", "to": "T", "delay": 0},
+        {"id": "p2", "from": "S", "to": "T", "delay": 3},
+        {"id": "p3", "from": "S", "to": "T", "delay": 3},
+    ],
+}
+
 failures: list[str] = []
 
 
@@ -54,10 +82,10 @@ def check(name: str, cond: bool, detail: str = "") -> None:
         failures.append(name)
 
 
-def request(base_url: str, payload):
+def post(base_url: str, path: str, payload):
     body = json.dumps(payload).encode()
     req = urllib.request.Request(
-        base_url + "/api/protected-paths", data=body,
+        base_url + path, data=body,
         headers={"Content-Type": "application/json"}, method="POST",
     )
     try:
@@ -65,6 +93,14 @@ def request(base_url: str, payload):
             return resp.status, json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read().decode())
+
+
+def request(base_url: str, payload):
+    return post(base_url, "/api/protected-paths", payload)
+
+
+def audit_request(base_url: str, payload):
+    return post(base_url, "/api/segment-audit", payload)
 
 
 def get(base_url: str, path: str):
@@ -276,6 +312,147 @@ def verify_error_cases(base_url: str) -> None:
           any(e["loc"] == "target" for e in data.get("errors", [])), str(data))
 
 
+def check_witness_json(witness, excluded_id, source, target, baseline_total,
+                       valid_ids, label) -> None:
+    """独立复核替代见证：完整双路、边互不重复、不含被审段、总延迟等于基准。"""
+    check(f"{label}：提供替代见证", witness is not None)
+    if witness is None:
+        return
+    check(f"{label}：见证总延迟与基准相同",
+          witness.get("totalDelay") == baseline_total,
+          f"{witness.get('totalDelay')} != {baseline_total}")
+    paths = witness.get("paths", [])
+    check(f"{label}：见证为两条完整链路", len(paths) == 2, str(paths))
+    ids, contiguous, recompute_ok = [], True, True
+    for p in paths:
+        segs = p.get("segments", [])
+        if not segs or segs[0]["from"] != source or segs[-1]["to"] != target:
+            contiguous = False
+        for a, b in zip(segs, segs[1:]):
+            if a["to"] != b["from"]:
+                contiguous = False
+        if sum(s["delay"] for s in segs) != p.get("delay"):
+            recompute_ok = False
+        ids.extend(s["id"] for s in segs)
+    check(f"{label}：见证链路为起点到终点的连续链路", contiguous)
+    check(f"{label}：见证各链路延迟可复算", recompute_ok)
+    check(f"{label}：见证双路边互不重复", len(ids) == len(set(ids)), str(ids))
+    check(f"{label}：见证不含被审段 {excluded_id}",
+          excluded_id not in ids, str(ids))
+    check(f"{label}：见证所用段均来自原始拓扑",
+          set(ids) <= valid_ids, str(ids))
+    check(f"{label}：见证总延迟 = 两链路延迟之和",
+          sum(p.get("delay", -1) for p in paths) == baseline_total)
+
+
+def verify_segment_audit(base_url: str) -> None:
+    print("\n== 5. 最优段审计：必经段判定与可替换见证 ==")
+
+    # 5.1 唯一全局最优（贪心反例）：全部已用段为必经段，且不得伪造见证。
+    status, plan = request(base_url, GREEDY_CASE)
+    status2, data = audit_request(base_url, GREEDY_CASE)
+    check("审计接口 HTTP 200", status == 200 and status2 == 200,
+          f"plan={status} audit={status2}")
+    check("审计 status=ok", data.get("status") == "ok", str(data))
+    check("审计基准方案与规划接口一致",
+          data.get("paths") == plan.get("paths")
+          and data.get("totalDelay") == plan.get("totalDelay"))
+    audits = data.get("audits", [])
+    used_ids = {s["id"] for p in plan["paths"] for s in p["segments"]}
+    check("审计覆盖基准方案全部已用段",
+          {a["segmentId"] for a in audits} == used_ids == {"e1", "e3", "e4", "e5"},
+          str(audits))
+    for a in audits:
+        check(f"唯一最优下段 {a['segmentId']} 判为必经段",
+              a["classification"] == "mandatory", str(a))
+        check(f"必经段 {a['segmentId']} 不伪造替代见证",
+              a["witness"] is None, str(a))
+
+    # 5.2 多个等价最优方案：每条已用段均可替换，见证独立复核。
+    expected = independent_optimum(
+        MULTI_OPTIMA_CASE["segments"], "S", "T")
+    check("独立枚举确认多路由案例最优总延迟为 4", expected == 4,
+          f"枚举得 {expected}")
+    status, data = audit_request(base_url, MULTI_OPTIMA_CASE)
+    check("多最优审计 HTTP 200 且 status=ok",
+          status == 200 and data.get("status") == "ok", str(data))
+    check("多最优审计基准总延迟 = 4（与独立枚举一致）",
+          data.get("totalDelay") == 4, str(data.get("totalDelay")))
+    valid_ids = {s["id"] for s in MULTI_OPTIMA_CASE["segments"]}
+    audits = data.get("audits", [])
+    check("多最优审计覆盖 4 条已用段", len(audits) == 4, str(audits))
+    for a in audits:
+        check(f"段 {a['segmentId']} 判为可替换",
+              a["classification"] == "replaceable", str(a))
+        check_witness_json(a.get("witness"), a["segmentId"], "S", "T", 4,
+                           valid_ids, f"段 {a['segmentId']} 的见证")
+
+    # 5.3 零延迟段 + 并行段：p1 必经、p2 可替换（见证为 p1+p3，总延迟 3）。
+    status, data = audit_request(base_url, MIXED_CASE)
+    check("混合案例审计 HTTP 200 且 status=ok",
+          status == 200 and data.get("status") == "ok", str(data))
+    by_id = {a["segmentId"]: a for a in data.get("audits", [])}
+    check("零延迟段 p1 判为必经段且无见证",
+          by_id.get("p1", {}).get("classification") == "mandatory"
+          and by_id.get("p1", {}).get("witness") is None, str(by_id))
+    check("并行段 p2 判为可替换",
+          by_id.get("p2", {}).get("classification") == "replaceable", str(by_id))
+    check_witness_json(by_id.get("p2", {}).get("witness"), "p2", "S", "T", 3,
+                       {"p1", "p2", "p3"}, "p2 的见证")
+    w = by_id.get("p2", {}).get("witness") or {}
+    w_ids = {s["id"] for p in w.get("paths", []) for s in p["segments"]}
+    check("p2 的替代见证恰为 p1+p3", w_ids == {"p1", "p3"}, str(w_ids))
+
+    # 5.4 按段复算：单段审计结果与全量审计完全一致。
+    for a in audits:
+        status, one = audit_request(
+            base_url, {**MULTI_OPTIMA_CASE, "segmentId": a["segmentId"]})
+        ok = (status == 200 and one.get("status") == "ok"
+              and len(one.get("audits", [])) == 1
+              and one["audits"][0] == a)
+        check(f"按段复算 {a['segmentId']} 与全量审计一致", ok, str(one))
+
+    # 5.5 重复查看同一段：归类与替代见证保持一致（响应逐字节相同）。
+    _, r1 = audit_request(base_url, MULTI_OPTIMA_CASE)
+    _, r2 = audit_request(base_url, MULTI_OPTIMA_CASE)
+    check("重复审计响应完全一致（确定性）",
+          json.dumps(r1, sort_keys=True) == json.dumps(r2, sort_keys=True))
+
+    # 5.6 审计接口的非法输入与边界：未知段标识 / 不可达 / 流不足。
+    status, err = audit_request(base_url, {**GREEDY_CASE, "segmentId": "zz"})
+    check("未知 segmentId 返回 400 且定位 segmentId",
+          status == 400
+          and any(e["loc"] == "segmentId" for e in err.get("errors", [])),
+          f"{status} {err}")
+    status, err = audit_request(base_url, {
+        "source": "S", "target": "T",
+        "segments": [
+            {"id": "e1", "from": "S", "to": "A", "delay": 1},
+            {"id": "e2", "from": "B", "to": "T", "delay": 1},
+        ],
+    })
+    check("不可达输入审计返回 400 且定位 target",
+          status == 400
+          and any(e["loc"] == "target" for e in err.get("errors", [])),
+          f"{status} {err}")
+    status, ins = audit_request(base_url, BOTTLENECK_CASE)
+    check("流不足时审计返回 insufficient 与割证据",
+          status == 200 and ins.get("status") == "insufficient"
+          and {e["id"] for e in ins.get("cut", {}).get("edges", [])} == {"e5"},
+          f"{status} {ins}")
+
+    # 5.7 页面含审计入口与防护钩子。
+    status, html = get(base_url, "/")
+    check("页面含最优段审计入口", status == 200 and "发起最优段审计" in html)
+    check("页面含必经段/可替换归类展示", "必经段" in html and "可替换" in html)
+    check("页面调用审计接口并支持按段复算",
+          "/api/segment-audit" in html and "按段复算" in html)
+    check("页面并列对比基准与替代方案（延迟、边集）",
+          "基准方案" in html and "替代方案" in html and "边集" in html)
+    check("页面编辑即失效防护（编辑清除旧结论并使在途响应作废）",
+          "onEdit" in html and "invalidatePending" in html)
+
+
 def verify_parallel_and_page(base_url: str) -> None:
     print("\n== 4. 并行光纤/零延迟 与 页面/冒烟 ==")
     payload = {
@@ -316,6 +493,7 @@ def main() -> int:
     verify_cut_evidence(args.base_url)
     verify_error_cases(args.base_url)
     verify_parallel_and_page(args.base_url)
+    verify_segment_audit(args.base_url)
 
     print("\n" + "=" * 60)
     if failures:
